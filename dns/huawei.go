@@ -2,13 +2,13 @@ package dns
 
 import (
 	"bytes"
-	"ddns-go/config"
-	"ddns-go/util"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
+
+	"github.com/jeessy2/ddns-go/v6/config"
+	"github.com/jeessy2/ddns-go/v6/util"
 )
 
 const (
@@ -18,9 +18,9 @@ const (
 // https://support.huaweicloud.com/api-dns/dns_api_64001.html
 // Huaweicloud Huaweicloud
 type Huaweicloud struct {
-	DNSConfig config.DNSConfig
-	Domains   config.Domains
-	TTL       int
+	DNS     config.DNS
+	Domains config.Domains
+	TTL     int
 }
 
 // HuaweicloudZonesResp zones response
@@ -49,14 +49,16 @@ type HuaweicloudRecordsets struct {
 }
 
 // Init 初始化
-func (hw *Huaweicloud) Init(conf *config.Config) {
-	hw.DNSConfig = conf.DNS
-	hw.Domains.GetNewIp(conf)
-	if conf.TTL == "" {
+func (hw *Huaweicloud) Init(dnsConf *config.DnsConfig, ipv4cache *util.IpCache, ipv6cache *util.IpCache) {
+	hw.Domains.Ipv4Cache = ipv4cache
+	hw.Domains.Ipv6Cache = ipv6cache
+	hw.DNS = dnsConf.DNS
+	hw.Domains.GetNewIp(dnsConf)
+	if dnsConf.TTL == "" {
 		// 默认300s
 		hw.TTL = 300
 	} else {
-		ttl, err := strconv.Atoi(conf.TTL)
+		ttl, err := strconv.Atoi(dnsConf.TTL)
 		if err != nil {
 			hw.TTL = 300
 		} else {
@@ -91,6 +93,8 @@ func (hw *Huaweicloud) addUpdateDomainRecords(recordType string) {
 		)
 
 		if err != nil {
+			util.Log("查询域名信息发生异常! %s", err)
+			domain.UpdateStatus = config.UpdatedFailed
 			return
 		}
 
@@ -99,7 +103,7 @@ func (hw *Huaweicloud) addUpdateDomainRecords(recordType string) {
 			// 名称相同才更新。华为云默认是模糊搜索
 			if record.Name == domain.String()+"." {
 				// 更新
-				hw.modify(record, domain, recordType, ipAddr)
+				hw.modify(record, domain, ipAddr)
 				find = true
 				break
 			}
@@ -117,10 +121,14 @@ func (hw *Huaweicloud) addUpdateDomainRecords(recordType string) {
 func (hw *Huaweicloud) create(domain *config.Domain, recordType string, ipAddr string) {
 	zone, err := hw.getZones(domain)
 	if err != nil {
+		util.Log("查询域名信息发生异常! %s", err)
+		domain.UpdateStatus = config.UpdatedFailed
 		return
 	}
+
 	if len(zone.Zones) == 0 {
-		log.Println("未能找到公网域名, 请检查域名是否添加")
+		util.Log("在DNS服务商中未找到根域名: %s", domain.DomainName)
+		domain.UpdateStatus = config.UpdatedFailed
 		return
 	}
 
@@ -145,21 +153,28 @@ func (hw *Huaweicloud) create(domain *config.Domain, recordType string, ipAddr s
 		record,
 		&result,
 	)
-	if err == nil && (len(result.Records) > 0 && result.Records[0] == ipAddr) {
-		log.Printf("新增域名解析 %s 成功！IP: %s", domain, ipAddr)
+
+	if err != nil {
+		util.Log("新增域名解析 %s 失败! 异常信息: %s", domain, err)
+		domain.UpdateStatus = config.UpdatedFailed
+		return
+	}
+
+	if len(result.Records) > 0 && result.Records[0] == ipAddr {
+		util.Log("新增域名解析 %s 成功! IP: %s", domain, ipAddr)
 		domain.UpdateStatus = config.UpdatedSuccess
 	} else {
-		log.Printf("新增域名解析 %s 失败！Status: %s", domain, result.Status)
+		util.Log("新增域名解析 %s 失败! 异常信息: %s", domain, result.Status)
 		domain.UpdateStatus = config.UpdatedFailed
 	}
 }
 
 // 修改
-func (hw *Huaweicloud) modify(record HuaweicloudRecordsets, domain *config.Domain, recordType string, ipAddr string) {
+func (hw *Huaweicloud) modify(record HuaweicloudRecordsets, domain *config.Domain, ipAddr string) {
 
 	// 相同不修改
 	if len(record.Records) > 0 && record.Records[0] == ipAddr {
-		log.Printf("你的IP %s 没有变化, 域名 %s", ipAddr, domain)
+		util.Log("你的IP %s 没有变化, 域名 %s", ipAddr, domain)
 		return
 	}
 
@@ -176,11 +191,17 @@ func (hw *Huaweicloud) modify(record HuaweicloudRecordsets, domain *config.Domai
 		&result,
 	)
 
-	if err == nil && (len(result.Records) > 0 && result.Records[0] == ipAddr) {
-		log.Printf("更新域名解析 %s 成功！IP: %s, 状态: %s", domain, ipAddr, result.Status)
+	if err != nil {
+		util.Log("更新域名解析 %s 失败! 异常信息: %s", domain, err)
+		domain.UpdateStatus = config.UpdatedFailed
+		return
+	}
+
+	if len(result.Records) > 0 && result.Records[0] == ipAddr {
+		util.Log("更新域名解析 %s 成功! IP: %s", domain, ipAddr)
 		domain.UpdateStatus = config.UpdatedSuccess
 	} else {
-		log.Printf("更新域名解析 %s 失败！Status: %s", domain, result.Status)
+		util.Log("更新域名解析 %s 失败! 异常信息: %s", domain, result.Status)
 		domain.UpdateStatus = config.UpdatedFailed
 	}
 }
@@ -211,13 +232,12 @@ func (hw *Huaweicloud) request(method string, url string, data interface{}, resu
 	)
 
 	if err != nil {
-		log.Println("http.NewRequest失败. Error: ", err)
 		return
 	}
 
 	s := util.Signer{
-		Key:    hw.DNSConfig.ID,
-		Secret: hw.DNSConfig.Secret,
+		Key:    hw.DNS.ID,
+		Secret: hw.DNS.Secret,
 	}
 	s.Sign(req)
 
@@ -225,7 +245,7 @@ func (hw *Huaweicloud) request(method string, url string, data interface{}, resu
 
 	client := util.CreateHTTPClient()
 	resp, err := client.Do(req)
-	err = util.GetHTTPResponse(resp, url, err, result)
+	err = util.GetHTTPResponse(resp, err, result)
 
 	return
 }

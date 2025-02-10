@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -32,10 +33,9 @@ func init() {
 
 // Logs web
 func Logs(writer http.ResponseWriter, request *http.Request) {
-	for _, log := range mlogs.Logs {
-		writer.Write([]byte(log))
-		writer.Write([]byte("<br/>"))
-	}
+	// mlogs.Logs数组转为json
+	logs, _ := json.Marshal(mlogs.Logs)
+	writer.Write(logs)
 }
 
 // ClearLog

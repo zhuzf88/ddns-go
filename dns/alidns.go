@@ -2,11 +2,11 @@ package dns
 
 import (
 	"bytes"
-	"ddns-go/config"
-	"ddns-go/util"
-	"log"
 	"net/http"
 	"net/url"
+
+	"github.com/jeessy2/ddns-go/v6/config"
+	"github.com/jeessy2/ddns-go/v6/util"
 )
 
 const (
@@ -16,20 +16,23 @@ const (
 // https://help.aliyun.com/document_detail/29776.html?spm=a2c4g.11186623.6.672.715a45caji9dMA
 // Alidns Alidns
 type Alidns struct {
-	DNSConfig config.DNSConfig
-	Domains   config.Domains
-	TTL       string
+	DNS     config.DNS
+	Domains config.Domains
+	TTL     string
+}
+
+// AlidnsRecord record
+type AlidnsRecord struct {
+	DomainName string
+	RecordID   string
+	Value      string
 }
 
 // AlidnsSubDomainRecords 记录
 type AlidnsSubDomainRecords struct {
 	TotalCount    int
 	DomainRecords struct {
-		Record []struct {
-			DomainName string
-			RecordID   string
-			Value      string
-		}
+		Record []AlidnsRecord
 	}
 }
 
@@ -40,14 +43,16 @@ type AlidnsResp struct {
 }
 
 // Init 初始化
-func (ali *Alidns) Init(conf *config.Config) {
-	ali.DNSConfig = conf.DNS
-	ali.Domains.GetNewIp(conf)
-	if conf.TTL == "" {
+func (ali *Alidns) Init(dnsConf *config.DnsConfig, ipv4cache *util.IpCache, ipv6cache *util.IpCache) {
+	ali.Domains.Ipv4Cache = ipv4cache
+	ali.Domains.Ipv6Cache = ipv6cache
+	ali.DNS = dnsConf.DNS
+	ali.Domains.GetNewIp(dnsConf)
+	if dnsConf.TTL == "" {
 		// 默认600s
 		ali.TTL = "600"
 	} else {
-		ali.TTL = conf.TTL
+		ali.TTL = dnsConf.TTL
 	}
 }
 
@@ -66,22 +71,33 @@ func (ali *Alidns) addUpdateDomainRecords(recordType string) {
 	}
 
 	for _, domain := range domains {
-		var record AlidnsSubDomainRecords
+		var records AlidnsSubDomainRecords
 		// 获取当前域名信息
-		params := url.Values{}
+		params := domain.GetCustomParams()
 		params.Set("Action", "DescribeSubDomainRecords")
 		params.Set("DomainName", domain.DomainName)
 		params.Set("SubDomain", domain.GetFullDomain())
 		params.Set("Type", recordType)
-		err := ali.request(params, &record)
+		err := ali.request(params, &records)
 
 		if err != nil {
+			util.Log("查询域名信息发生异常! %s", err)
+			domain.UpdateStatus = config.UpdatedFailed
 			return
 		}
 
-		if record.TotalCount > 0 {
+		if records.TotalCount > 0 {
+			// 默认第一个
+			recordSelected := records.DomainRecords.Record[0]
+			if params.Has("RecordId") {
+				for i := 0; i < len(records.DomainRecords.Record); i++ {
+					if records.DomainRecords.Record[i].RecordID == params.Get("RecordId") {
+						recordSelected = records.DomainRecords.Record[i]
+					}
+				}
+			}
 			// 存在，更新
-			ali.modify(record, domain, recordType, ipAddr)
+			ali.modify(recordSelected, domain, recordType, ipAddr)
 		} else {
 			// 不存在，创建
 			ali.create(domain, recordType, ipAddr)
@@ -92,7 +108,7 @@ func (ali *Alidns) addUpdateDomainRecords(recordType string) {
 
 // 创建
 func (ali *Alidns) create(domain *config.Domain, recordType string, ipAddr string) {
-	params := url.Values{}
+	params := domain.GetCustomParams()
 	params.Set("Action", "AddDomainRecord")
 	params.Set("DomainName", domain.DomainName)
 	params.Set("RR", domain.GetSubDomain())
@@ -103,28 +119,34 @@ func (ali *Alidns) create(domain *config.Domain, recordType string, ipAddr strin
 	var result AlidnsResp
 	err := ali.request(params, &result)
 
-	if err == nil && result.RecordID != "" {
-		log.Printf("新增域名解析 %s 成功！IP: %s", domain, ipAddr)
+	if err != nil {
+		util.Log("新增域名解析 %s 失败! 异常信息: %s", domain, err)
+		domain.UpdateStatus = config.UpdatedFailed
+		return
+	}
+
+	if result.RecordID != "" {
+		util.Log("新增域名解析 %s 成功! IP: %s", domain, ipAddr)
 		domain.UpdateStatus = config.UpdatedSuccess
 	} else {
-		log.Printf("新增域名解析 %s 失败！", domain)
+		util.Log("新增域名解析 %s 失败! 异常信息: %s", domain, "返回RecordId为空")
 		domain.UpdateStatus = config.UpdatedFailed
 	}
 }
 
 // 修改
-func (ali *Alidns) modify(record AlidnsSubDomainRecords, domain *config.Domain, recordType string, ipAddr string) {
+func (ali *Alidns) modify(recordSelected AlidnsRecord, domain *config.Domain, recordType string, ipAddr string) {
 
 	// 相同不修改
-	if len(record.DomainRecords.Record) > 0 && record.DomainRecords.Record[0].Value == ipAddr {
-		log.Printf("你的IP %s 没有变化, 域名 %s", ipAddr, domain)
+	if recordSelected.Value == ipAddr {
+		util.Log("你的IP %s 没有变化, 域名 %s", ipAddr, domain)
 		return
 	}
 
-	params := url.Values{}
+	params := domain.GetCustomParams()
 	params.Set("Action", "UpdateDomainRecord")
 	params.Set("RR", domain.GetSubDomain())
-	params.Set("RecordId", record.DomainRecords.Record[0].RecordID)
+	params.Set("RecordId", recordSelected.RecordID)
 	params.Set("Type", recordType)
 	params.Set("Value", ipAddr)
 	params.Set("TTL", ali.TTL)
@@ -132,11 +154,17 @@ func (ali *Alidns) modify(record AlidnsSubDomainRecords, domain *config.Domain, 
 	var result AlidnsResp
 	err := ali.request(params, &result)
 
-	if err == nil && result.RecordID != "" {
-		log.Printf("更新域名解析 %s 成功！IP: %s", domain, ipAddr)
+	if err != nil {
+		util.Log("更新域名解析 %s 失败! 异常信息: %s", domain, err)
+		domain.UpdateStatus = config.UpdatedFailed
+		return
+	}
+
+	if result.RecordID != "" {
+		util.Log("更新域名解析 %s 成功! IP: %s", domain, ipAddr)
 		domain.UpdateStatus = config.UpdatedSuccess
 	} else {
-		log.Printf("更新域名解析 %s 失败！", domain)
+		util.Log("更新域名解析 %s 失败! 异常信息: %s", domain, "返回RecordId为空")
 		domain.UpdateStatus = config.UpdatedFailed
 	}
 }
@@ -144,7 +172,7 @@ func (ali *Alidns) modify(record AlidnsSubDomainRecords, domain *config.Domain, 
 // request 统一请求接口
 func (ali *Alidns) request(params url.Values, result interface{}) (err error) {
 
-	util.AliyunSigner(ali.DNSConfig.ID, ali.DNSConfig.Secret, &params)
+	util.AliyunSigner(ali.DNS.ID, ali.DNS.Secret, &params)
 
 	req, err := http.NewRequest(
 		"GET",
@@ -154,13 +182,12 @@ func (ali *Alidns) request(params url.Values, result interface{}) (err error) {
 	req.URL.RawQuery = params.Encode()
 
 	if err != nil {
-		log.Println("http.NewRequest失败. Error: ", err)
 		return
 	}
 
 	client := util.CreateHTTPClient()
 	resp, err := client.Do(req)
-	err = util.GetHTTPResponse(resp, alidnsEndpoint, err, result)
+	err = util.GetHTTPResponse(resp, err, result)
 
 	return
 }
